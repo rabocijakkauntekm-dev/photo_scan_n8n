@@ -1,9 +1,9 @@
+import math
 import cv2
 import numpy as np
 
 MAX_SIDE = 2000
 """Максимальный размер стороны при уменьшении изображения для детекции контура."""
-
 
 # ----------------------------------------------------------------------
 # Вспомогательные функции для детекции и перспективы
@@ -68,18 +68,116 @@ def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
     """
     Отбрасывает заведомо плохие результаты перспективного преобразования.
     """
-    if warped.shape[0] < 300 or warped.shape[1] < 300:
+    oh, ow = original.shape[:2]
+    wh, ww = warped.shape[:2]
+
+    if wh < 300 or ww < 300:
         return False
-    original_area = original.shape[0] * original.shape[1]
-    warped_area = warped.shape[0] * warped.shape[1]
-    if warped_area < original_area * 0.08:
+
+    original_area = oh * ow
+    warped_area = wh * ww
+    area_ratio = warped_area / original_area
+    if area_ratio < 0.1 or area_ratio > 0.95:   # слишком маленький или почти весь кадр
         return False
+
+    # Соотношение сторон итогового документа должно быть разумным
+    aspect_orig = ow / oh
+    aspect_warp = ww / wh
+    if aspect_warp < 0.3 or aspect_warp > 3.5:
+        return False
+    if abs(aspect_warp - aspect_orig) > 2.0:    # слишком сильное отличие от оригинала
+        return False
+
     return True
 
 
 # ----------------------------------------------------------------------
-# Детекция контура документа (две стратегии)
+# Вспомогательная функция: пересечение двух прямых
 # ----------------------------------------------------------------------
+
+def line_intersection(line1: np.ndarray, line2: np.ndarray) -> np.ndarray | None:
+    """
+    Вычисляет точку пересечения двух отрезков, заданных координатами (x1,y1,x2,y2).
+    Возвращает [x, y] или None, если отрезки параллельны.
+    """
+    x1, y1, x2, y2 = line1
+    x3, y3, x4, y4 = line2
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-6:
+        return None
+    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denom
+    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
+    return np.array([px, py], dtype=np.float32)
+
+
+# ----------------------------------------------------------------------
+# Детекция контура документа (три стратегии)
+# ----------------------------------------------------------------------
+
+def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
+    """
+    Стратегия 0 (новая): ищет четыре прямые линии, образующие замкнутый контур,
+    с помощью HoughLinesP. Отбирает по направлениям и находит углы.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=120, maxLineGap=60)
+    if lines is None or len(lines) < 4:
+        return None
+
+    # Разделяем линии на горизонтальные и вертикальные по углу
+    horizontal = []
+    vertical = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        # Приводим к диапазону (-180, 180]
+        if angle < -90:
+            angle += 180
+        elif angle > 90:
+            angle -= 180
+        if abs(angle) <= 15:          # горизонтальные (~0°)
+            horizontal.append((x1, y1, x2, y2))
+        elif abs(angle - 90) <= 15:   # вертикальные (~90°)
+            vertical.append((x1, y1, x2, y2))
+
+    if len(horizontal) < 2 or len(vertical) < 2:
+        return None
+
+    # Сортируем горизонтальные линии по средней Y-координате (сверху вниз)
+    horizontal.sort(key=lambda l: (l[1] + l[3]) / 2)
+    top_line = horizontal[0]
+    bottom_line = horizontal[-1]
+
+    # Вертикальные линии сортируем по средней X-координате (слева направо)
+    vertical.sort(key=lambda l: (l[0] + l[2]) / 2)
+    left_line = vertical[0]
+    right_line = vertical[-1]
+
+    # Находим четыре угла как пересечения
+    tl = line_intersection(top_line, left_line)
+    tr = line_intersection(top_line, right_line)
+    br = line_intersection(bottom_line, right_line)
+    bl = line_intersection(bottom_line, left_line)
+
+    if tl is None or tr is None or br is None or bl is None:
+        return None
+
+    points = np.array([tl, tr, br, bl], dtype=np.float32)
+    # Проверяем, что четырёхугольник выпуклый и имеет ненулевую площадь
+    hull = cv2.convexHull(points.reshape(-1, 1, 2))
+    if len(hull) != 4:
+        return None
+    area = cv2.contourArea(hull)
+    img_area = image_bgr.shape[0] * image_bgr.shape[1]
+    if area < img_area * 0.15:
+        return None
+
+    return points
+
 
 def find_document_contour_canny(image_bgr: np.ndarray) -> np.ndarray | None:
     """
@@ -104,7 +202,9 @@ def find_document_contour_canny(image_bgr: np.ndarray) -> np.ndarray | None:
     # Если нет четырёхугольника, пробуем взять минимальный прямоугольник самого большого контура
     if contours:
         rect = cv2.minAreaRect(contours[0])
-        return cv2.boxPoints(rect).astype(np.float32)
+        box = cv2.boxPoints(rect)
+        if cv2.contourArea(box) > image_area * 0.15:
+            return box.astype(np.float32)
     return None
 
 
@@ -149,9 +249,12 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
     """
     resized, scale_to_original = resize_for_detection(image_bgr)
 
-    # Сначала пробуем детекцию через Canny
-    points = find_document_contour_canny(resized)
-    detector = "canny"
+    # Пробуем три детектора по очереди
+    points = find_document_contour_hough(resized)
+    detector = "hough"
+    if points is None:
+        points = find_document_contour_canny(resized)
+        detector = "canny"
     if points is None:
         points = find_document_contour_brightness(resized)
         detector = "brightness" if points is not None else "none"
@@ -194,7 +297,7 @@ def normalize_illumination(gray: np.ndarray) -> np.ndarray:
 def enhance_color_scan(image_bgr: np.ndarray) -> np.ndarray:
     """
     Цветное улучшение: выравнивание освещения, CLAHE, билатеральный фильтр,
-    повышение резкости и мягкое отбеливание бумаги.
+    повышение резкости и мягкое отбеливание бумаги (ослабленные настройки).
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     norm = normalize_illumination(gray)
@@ -202,21 +305,26 @@ def enhance_color_scan(image_bgr: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_chan, a_chan, b_chan = cv2.split(lab)
 
-    clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+    # Снижена агрессивность CLAHE
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
     l_chan = clahe.apply(norm)
     l_chan = cv2.normalize(l_chan, None, 0, 255, cv2.NORM_MINMAX)
 
     merged = cv2.merge([l_chan, a_chan, b_chan])
     enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-    enhanced = cv2.bilateralFilter(enhanced, d=7, sigmaColor=35, sigmaSpace=35)
-    enhanced = unsharp_mask(enhanced, sigma=0.8, strength=0.95)
 
-    # Лёгкое отбеливание бумажных участков
+    # Более мягкий билатеральный фильтр
+    enhanced = cv2.bilateralFilter(enhanced, d=5, sigmaColor=25, sigmaSpace=25)
+
+    # Умеренное повышение резкости
+    enhanced = unsharp_mask(enhanced, sigma=0.5, strength=0.6)
+
+    # Лёгкое отбеливание бумажных участков (ослаблено)
     hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
     paper_mask = cv2.inRange(hsv, (0, 0, 120), (180, 80, 255)).astype(np.float32) / 255.0
     paper_mask = cv2.GaussianBlur(paper_mask, (9, 9), 0)[..., None]
     white_bg = np.full_like(enhanced, 247, dtype=np.float32)
-    mixed = enhanced.astype(np.float32) * (1.0 - 0.22 * paper_mask) + white_bg * (0.22 * paper_mask)
+    mixed = enhanced.astype(np.float32) * (1.0 - 0.15 * paper_mask) + white_bg * (0.15 * paper_mask)
     return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
@@ -226,9 +334,10 @@ def enhance_clean_gray(image_bgr: np.ndarray) -> np.ndarray:
     """
     color_enhanced = enhance_color_scan(image_bgr)
     gray = cv2.cvtColor(color_enhanced, cv2.COLOR_BGR2GRAY)
-    gray = cv2.fastNlMeansDenoising(gray, None, h=6, templateWindowSize=7, searchWindowSize=21)
+    # Снижена сила шумоподавления
+    gray = cv2.fastNlMeansDenoising(gray, None, h=4, templateWindowSize=7, searchWindowSize=21)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    return unsharp_mask(gray, sigma=0.7, strength=0.55)
+    return unsharp_mask(gray, sigma=0.7, strength=0.45)
 
 
 def enhance_bw(image_bgr: np.ndarray) -> np.ndarray:
