@@ -5,10 +5,6 @@ import numpy as np
 MAX_SIDE = 2000
 
 
-# ----------------------------------------------------------------------
-# Вспомогательные функции
-# ----------------------------------------------------------------------
-
 def resize_for_detection(image: np.ndarray, max_side: int = MAX_SIDE) -> tuple[np.ndarray, float]:
     h, w = image.shape[:2]
     scale = max_side / float(max(h, w))
@@ -172,47 +168,52 @@ def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
 
 
 # ----------------------------------------------------------------------
-# Надёжный fallback-обрезатель (всегда что-то возвращает)
+# Улучшенный fallback‑обрезатель (ищет весь лист бумаги)
 # ----------------------------------------------------------------------
 
 def simple_crop_by_content(image_bgr: np.ndarray) -> np.ndarray:
     """
-    Если классические детекторы не нашли контур, эта функция всё равно обрежет
-    по самому большому содержательному блоку (текст, изображение) с отступом.
+    Находит светлую область (бумагу) даже при слабом контрасте с фоном,
+    используя размытую маску и сильную морфологию.
+    Если бумага не найдена — обрезает по тексту.
     """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+    blurred = cv2.GaussianBlur(gray, (21, 21), 0)
 
-    # Попытка 1: светлая область (бумага)
+    # Локальный порог: считаем среднее по размытому изображению
     mean_val = np.mean(blurred)
-    _, light_mask = cv2.threshold(blurred, mean_val - 15, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    light_closed = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    contours_light, _ = cv2.findContours(light_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours_light:
-        largest = max(contours_light, key=cv2.contourArea)
-        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+    # Бинаризация: пиксели светлее (mean-20) — это бумага
+    _, paper_mask = cv2.threshold(blurred, mean_val - 20, 255, cv2.THRESH_BINARY)
+
+    # Закрываем маску, чтобы заполнить разрывы от текста и теней
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
+    closed = cv2.morphologyEx(paper_mask, cv2.MORPH_CLOSE, kernel, iterations=4)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        # Площадь контура должна быть не менее 30% от всего кадра
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.3:
             x, y, w, h = cv2.boundingRect(largest)
             return _apply_padding(image_bgr, x, y, w, h)
 
-    # Попытка 2: тёмный текст
+    # Если не получилось — пробуем найти тёмный текст (на случай инвертированного фона)
     _, dark_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dark_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    dark_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=4)
     contours_dark, _ = cv2.findContours(dark_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours_dark:
         largest = max(contours_dark, key=cv2.contourArea)
-        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.3:
             x, y, w, h = cv2.boundingRect(largest)
             return _apply_padding(image_bgr, x, y, w, h)
 
-    # Попытка 3: обрезаем всё, что не является полностью белым фоном
+    # В крайнем случае — обрезаем белые поля (пиксели, где яркость < 250)
     non_white = np.where(gray < 250)
     if non_white[0].size > 0:
         y_min, y_max = non_white[0].min(), non_white[0].max()
         x_min, x_max = non_white[1].min(), non_white[1].max()
         return _apply_padding(image_bgr, x_min, y_min, x_max - x_min, y_max - y_min)
 
-    # Если изображение абсолютно белое – возвращаем как есть
     return image_bgr
 
 
@@ -227,15 +228,10 @@ def _apply_padding(image, x, y, w, h, pad_ratio=0.02):
 
 
 # ----------------------------------------------------------------------
-# Основная функция обрезки
+# Главная функция обрезки
 # ----------------------------------------------------------------------
 
 def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str]:
-    """
-    Ищет документ и обрезает его (без поворота).
-    Если контур найден – делает обычную/перспективную обрезку.
-    Если нет – использует fallback по содержимому.
-    """
     resized, scale = resize_for_detection(image_bgr)
 
     points = find_document_contour_hough(resized)
@@ -288,13 +284,13 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
             return cropped, True, f"{detector}_fallback"
         return warped, True, f"{detector}_warp"
 
-    # Контур не найден → fallback по содержимому
+    # Контур не найден — используем надёжный поиск бумаги
     fallback = simple_crop_by_content(image_bgr)
-    return fallback, True, "fallback_content"
+    return fallback, True, "fallback_paper"
 
 
 # ----------------------------------------------------------------------
-# Функции улучшения (сохранены мягкие)
+# Функции улучшения
 # ----------------------------------------------------------------------
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 0.8) -> np.ndarray:
