@@ -5,10 +5,6 @@ import numpy as np
 MAX_SIDE = 2000
 
 
-# ----------------------------------------------------------------------
-# Вспомогательные функции
-# ----------------------------------------------------------------------
-
 def resize_for_detection(image, max_side=MAX_SIDE):
     h, w = image.shape[:2]
     scale = max_side / float(max(h, w))
@@ -18,72 +14,51 @@ def resize_for_detection(image, max_side=MAX_SIDE):
     return image.copy(), 1.0
 
 
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-
-# ----------------------------------------------------------------------
-# Поиск документа: Canny + контуры
-# ----------------------------------------------------------------------
-
-def find_document_contour(image_bgr):
+def estimate_skew_angle(image_bgr):
+    """
+    Угол поворота документа по длинным линиям (HoughLinesP).
+    Использует медианный угол горизонтальных линий для устойчивости.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
+                            minLineLength=100, maxLineGap=40)
+    if lines is None or len(lines) < 3:
+        # Fallback: определяем угол по вытянутости самого крупного контура
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            rect = cv2.minAreaRect(largest)
+            angle = rect[2]
+            if angle < -45:
+                angle += 90
+            elif angle > 45:
+                angle -= 90
+            return angle
+        return 0.0
 
-    # Сортируем по площади, берём самый крупный
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    img_area = image_bgr.shape[0] * image_bgr.shape[1]
-    min_area = img_area * 0.25   # документ должен занимать хотя бы 25% кадра
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        # Нормализуем угол к диапазону [-45, 45]
+        if angle < -45:
+            angle += 180
+        elif angle > 45:
+            angle -= 180
+        angles.append(abs(angle))
 
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32)
-        # Если не четырёхугольник – берём минимальный ограничивающий прямоугольник
-        rect = cv2.minAreaRect(c)
-        box = cv2.boxPoints(rect)
-        if cv2.contourArea(box) >= min_area:
-            return box.astype(np.float32)
-    return None
+    return np.median(angles) if angles else 0.0
 
 
-# ----------------------------------------------------------------------
-# Аффинное выравнивание (поворот + обрезка)
-# ----------------------------------------------------------------------
-
-def rotate_and_crop(image_bgr, contour):
+def rotate_image_with_auto_canvas(image, angle, border_value=(255, 255, 255)):
     """
-    Выравнивает документ по найденному контуру:
-    - поворачивает так, чтобы документ встал горизонтально,
-    - обрезает по границам документа после поворота.
+    Поворот с автоматическим расширением холста, чтобы полностью вместить содержимое.
     """
-    rect = cv2.minAreaRect(contour)
-    angle = rect[2]
-    # Нормализуем угол к диапазону [-45, 45]
-    if angle < -45:
-        angle += 90
-    elif angle > 45:
-        angle -= 90
-
-    # Расширяем холст, чтобы не обрезать углы после поворота
-    h, w = image_bgr.shape[:2]
+    h, w = image.shape[:2]
     corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
     center = (w / 2, h / 2)
     rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
@@ -94,66 +69,105 @@ def rotate_and_crop(image_bgr, contour):
     new_h = int(np.ceil(y_max - y_min))
     rot_mat[0, 2] += (new_w / 2) - center[0]
     rot_mat[1, 2] += (new_h / 2) - center[1]
-
-    rotated = cv2.warpAffine(image_bgr, rot_mat, (new_w, new_h),
+    rotated = cv2.warpAffine(image, rot_mat, (new_w, new_h),
                              borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(255, 255, 255))
+                             borderValue=border_value)
+    return rotated
 
-    # На повёрнутом изображении ищем прямоугольник документа (бинаризация + контур)
+
+def find_document_rect_on_rotated(image_bgr):
+    """
+    Находит ограничивающий прямоугольник документа на уже повёрнутом изображении.
+    Использует адаптивный порог и морфологическое закрытие для склеивания текста/таблиц.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    # Адаптивная бинаризация: текст и линии становятся чёрными на белом фоне
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 21, 8)
+    # Морфология: закрываем промежутки внутри текстовых блоков
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    dilated = cv2.dilate(closed, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Самый большой контур (почти весь документ)
+    largest = max(contours, key=cv2.contourArea)
+    img_area = image_bgr.shape[0] * image_bgr.shape[1]
+    # Порог площади: документ должен занимать > 30% изображения
+    if cv2.contourArea(largest) < img_area * 0.3:
+        # Иногда на однородном фоне контур может быть небольшим, тогда пробуем другой метод
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours2, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours2:
+            largest2 = max(contours2, key=cv2.contourArea)
+            if cv2.contourArea(largest2) > img_area * 0.3:
+                x, y, w, h = cv2.boundingRect(largest2)
+                return _pad_rect(x, y, w, h, image_bgr.shape)
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return _pad_rect(x, y, w, h, image_bgr.shape)
+
+
+def _pad_rect(x, y, w, h, img_shape):
+    """Добавляет отступ 2% и обрезает по границам изображения."""
+    pad_x = int(w * 0.02)
+    pad_y = int(h * 0.02)
+    x = max(0, x - pad_x)
+    y = max(0, y - pad_y)
+    w = min(w + 2 * pad_x, img_shape[1] - x)
+    h = min(h + 2 * pad_y, img_shape[0] - y)
+    return (x, y, w, h)
+
+
+def crop_document_if_found(image_bgr):
+    """
+    Надёжная обрезка и выпрямление документа:
+    1. Определяем угол наклона текста.
+    2. Поворачиваем изображение (с расширением холста).
+    3. Находим ограничивающий прямоугольник документа на выровненном изображении.
+    4. Обрезаем и возвращаем результат.
+    Если обрезка не удалась, возвращаем хотя бы повёрнутое изображение.
+    """
+    # Угол по уменьшенной копии
+    small, _ = resize_for_detection(image_bgr, max_side=800)
+    angle = estimate_skew_angle(small)
+
+    # Если угол меньше 0.5°, считаем документ и так ровным, но всё равно обрезаем
+    if abs(angle) < 0.5:
+        rotated = image_bgr
+    else:
+        rotated = rotate_image_with_auto_canvas(image_bgr, angle, border_value=(255, 255, 255))
+
+    # Ищем прямоугольник документа на повёрнутом изображении
+    rect = find_document_rect_on_rotated(rotated)
+    if rect is not None:
+        x, y, w, h = rect
+        cropped = rotated[y:y+h, x:x+w].copy()
+        # Проверка минимального размера (хотя бы 150x150)
+        if cropped.shape[0] > 150 and cropped.shape[1] > 150:
+            return cropped, True, f"rotated_{angle:.1f}_cropped"
+
+    # Если не нашли хороший прямоугольник, пробуем обрезать по контуру Otsu
     gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        x, y, rw, rh = cv2.boundingRect(largest)
-        # Добавляем небольшой отступ (2%)
-        pad_x = int(rw * 0.02)
-        pad_y = int(rh * 0.02)
-        x = max(0, x - pad_x)
-        y = max(0, y - pad_y)
-        rw = min(rw + 2 * pad_x, rotated.shape[1] - x)
-        rh = min(rh + 2 * pad_y, rotated.shape[0] - y)
-        return rotated[y:y+rh, x:x+rw], True
+        x, y, w, h = cv2.boundingRect(largest)
+        cropped = rotated[y:y+h, x:x+w].copy()
+        if cropped.shape[0] > 150 and cropped.shape[1] > 150:
+            return cropped, True, f"rotated_{angle:.1f}_otsu_crop"
 
-    return rotated, True   # если не получилось обрезать, возвращаем хотя бы повёрнутое
+    # Если вообще ничего не получилось – возвращаем хотя бы повёрнутое изображение без обрезки
+    return rotated, True, f"rotated_{angle:.1f}_nocrop"
 
 
 # ----------------------------------------------------------------------
-# Основная функция обрезки
-# ----------------------------------------------------------------------
-
-def crop_document_if_found(image_bgr):
-    """
-    Надёжная обрезка документа:
-    - сначала ищем контур через Canny,
-    - если не найден, пробуем найти через адаптивную бинаризацию (fallback).
-    """
-    # Основной метод
-    contour = find_document_contour(image_bgr)
-    if contour is not None:
-        cropped, ok = rotate_and_crop(image_bgr, contour)
-        if ok and cropped.shape[0] > 100 and cropped.shape[1] > 100:
-            return cropped, True, "canny"
-
-    # Fallback: ищем светлую область на тёмном фоне (для фото бумаги на столе)
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) > gray.shape[0] * gray.shape[1] * 0.25:
-            x, y, w, h = cv2.boundingRect(largest)
-            crop = image_bgr[y:y+h, x:x+w].copy()
-            if crop.shape[0] > 100 and crop.shape[1] > 100:
-                return crop, True, "otsu_fallback"
-
-    # Ничего не найдено – возвращаем исходное
-    return image_bgr, False, "none"
-
-
-# ----------------------------------------------------------------------
-# Функции улучшения (мягкие)
+# Функции улучшения (оставлены без изменений, mild по умолчанию)
 # ----------------------------------------------------------------------
 
 def unsharp_mask(image, sigma=1.0, strength=0.8):
