@@ -1,313 +1,402 @@
-"""
-scanner.py
-Устойчивый к ошибкам сканнер документа с двумя методами поиска четырёхугольника.
-"""
-
+import math
 import cv2
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
 
-# ------------------------------------------------------------
-# 1. Геометрические функции
-# ------------------------------------------------------------
+MAX_SIDE = 2000
+
+
+# ----------------------------------------------------------------------
+# Вспомогательные функции
+# ----------------------------------------------------------------------
+
+def resize_for_detection(image: np.ndarray, max_side: int = MAX_SIDE) -> tuple[np.ndarray, float]:
+    h, w = image.shape[:2]
+    scale = max_side / float(max(h, w))
+    if scale < 1.0:
+        resized = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        return resized, 1.0 / scale
+    return image.copy(), 1.0
+
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """Упорядочивает 4 точки: левый-верхний, правый-верхний, правый-нижний, левый-нижний."""
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]   # левый-верхний
-    rect[2] = pts[np.argmax(s)]   # правый-нижний
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # правый-верхний
-    rect[3] = pts[np.argmax(diff)]  # левый-нижний
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
 
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """Перспективное выпрямление по четырём точкам."""
+def four_point_transform(image: np.ndarray, pts: np.ndarray, border_value=(255, 255, 255)) -> np.ndarray:
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
-
-    width_top = np.linalg.norm(tr - tl)
-    width_bottom = np.linalg.norm(br - bl)
-    max_width = max(int(width_top), int(width_bottom))
-
-    height_right = np.linalg.norm(br - tr)
-    height_left = np.linalg.norm(bl - tl)
-    max_height = max(int(height_right), int(height_left))
-
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype=np.float32)
-
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (max_width, max_height))
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = max(int(width_a), int(width_b))
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = max(int(height_a), int(height_b))
+    if max_width < 50 or max_height < 50:
+        return image
+    dst = np.array([[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]], dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, matrix, (max_width, max_height),
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
     return warped
 
 
-# ------------------------------------------------------------
-# 2. Поиск документа – три стратегии, без ошибок Truth value
-# ------------------------------------------------------------
-
-def find_document_contour_robust(image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Основной метод: поиск по контуру.
-    Возвращает 4 точки (float32) или None.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_enh = clahe.apply(gray)
-
-    blurred = cv2.GaussianBlur(gray_enh, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 11, 2)
-
-    kernel = np.ones((7, 7), np.uint8)
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:   # contours – список, проверка допустима
+def line_intersection(line1: np.ndarray, line2: np.ndarray) -> np.ndarray | None:
+    x1, y1, x2, y2 = line1
+    x3, y3, x4, y4 = line2
+    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(denom) < 1e-6:
         return None
-
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    img_area = h * w
-    best_quad = None
-    best_score = 0.0
-
-    for cnt in contours[:10]:
-        area = cv2.contourArea(cnt)
-        area_ratio = area / img_area
-        if area_ratio < 0.03 or area_ratio > 0.98:
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            pts = approx.reshape(4, 2).astype(np.float32)
-            # Проверка на вырожденность
-            rect = order_points(pts)
-            (tl, tr, br, bl) = rect
-            w1 = np.linalg.norm(tr - tl)
-            w2 = np.linalg.norm(br - bl)
-            h1 = np.linalg.norm(bl - tl)
-            h2 = np.linalg.norm(br - tr)
-            if min(w1, w2) < 20 or min(h1, h2) < 20:
-                continue
-            aspect = max(w1, w2) / max(h1, h2) if max(h1, h2) > 0 else 1
-            if aspect > 4.0 or aspect < 0.25:
-                continue
-
-            score = area / img_area
-            if score > best_score:
-                best_score = score
-                best_quad = pts
-
-    return best_quad
+    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denom
+    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denom
+    return np.array([px, py], dtype=np.float32)
 
 
-def find_document_lines_method(image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Альтернативный метод: поиск через пересечения линий (когда контур не найден).
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
+# ----------------------------------------------------------------------
+# Детекция контура документа
+# ----------------------------------------------------------------------
 
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
-                            minLineLength=100, maxLineGap=20)
-
-    # lines может быть None или массивом
-    if lines is None:
+def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=150, maxLineGap=50)
+    if lines is None or len(lines) < 4:
         return None
-    if lines.size == 0:
-        return None
-
-    h_lines = []
-    v_lines = []
+    horizontal = []
+    vertical = []
     for line in lines:
-        # line может быть (1,4) или (4,)
-        if len(line.shape) > 1:
-            x1, y1, x2, y2 = line[0]
-        else:
-            x1, y1, x2, y2 = line
-        angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
-        if abs(angle) < 30:
-            h_lines.append((x1, y1, x2, y2))
-        elif abs(abs(angle) - 90) < 30:
-            v_lines.append((x1, y1, x2, y2))
-
-    if len(h_lines) < 2 or len(v_lines) < 2:
+        x1, y1, x2, y2 = line[0]
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        if angle < -90:
+            angle += 180
+        elif angle > 90:
+            angle -= 180
+        if abs(angle) <= 10:
+            horizontal.append((x1, y1, x2, y2))
+        elif abs(angle - 90) <= 10:
+            vertical.append((x1, y1, x2, y2))
+    if len(horizontal) < 2 or len(vertical) < 2:
         return None
-
-    all_points = []
-    for h in h_lines[:5]:
-        for v in v_lines[:5]:
-            x1_h, y1_h, x2_h, y2_h = h
-            x1_v, y1_v, x2_v, y2_v = v
-            A1 = y2_h - y1_h
-            B1 = x1_h - x2_h
-            C1 = A1 * x1_h + B1 * y1_h
-            A2 = y2_v - y1_v
-            B2 = x1_v - x2_v
-            C2 = A2 * x1_v + B2 * y1_v
-            det = A1 * B2 - A2 * B1
-            if abs(det) > 1e-5:
-                x = (B2 * C1 - B1 * C2) / det
-                y = (A1 * C2 - A2 * C1) / det
-                if 0 <= x < w and 0 <= y < h:
-                    all_points.append((x, y))
-
-    if len(all_points) < 4:
+    horizontal.sort(key=lambda l: (l[1] + l[3]) / 2)
+    vertical.sort(key=lambda l: (l[0] + l[2]) / 2)
+    top_line = horizontal[0]
+    bottom_line = horizontal[-1]
+    left_line = vertical[0]
+    right_line = vertical[-1]
+    tl = line_intersection(top_line, left_line)
+    tr = line_intersection(top_line, right_line)
+    br = line_intersection(bottom_line, right_line)
+    bl = line_intersection(bottom_line, left_line)
+    if tl is None or tr is None or br is None or bl is None:
         return None
-
-    points = np.array(all_points, dtype=np.float32)
-    hull = cv2.convexHull(points)
-    if hull is None or hull.shape[0] < 4:
+    points = np.array([tl, tr, br, bl], dtype=np.float32)
+    hull = cv2.convexHull(points.reshape(-1, 1, 2))
+    if len(hull) != 4:
         return None
-
-    peri = cv2.arcLength(hull, True)
-    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
-    if approx is not None and len(approx) == 4:
-        return approx.reshape(4, 2).astype(np.float32)
-
-    # Fallback: минимальный ограничивающий прямоугольник
-    x_min = np.min(points[:, 0])
-    x_max = np.max(points[:, 0])
-    y_min = np.min(points[:, 1])
-    y_max = np.max(points[:, 1])
-    return np.array([[x_min, y_min], [x_max, y_min],
-                     [x_max, y_max], [x_min, y_max]], dtype=np.float32)
+    if cv2.contourArea(hull) < image_bgr.shape[0] * image_bgr.shape[1] * 0.15:
+        return None
+    return points
 
 
-def find_document_fallback(image: np.ndarray) -> np.ndarray:
-    """Самый простой метод: небольшой отступ от краёв."""
-    h, w = image.shape[:2]
-    margin = int(min(h, w) * 0.03)   # 3% от меньшей стороны
-    margin = max(10, min(margin, w//4, h//4))
-    return np.array([[margin, margin],
-                     [w - margin, margin],
-                     [w - margin, h - margin],
-                     [margin, h - margin]], dtype=np.float32)
+def find_document_contour_canny(image_bgr: np.ndarray) -> np.ndarray | None:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 75, 200)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    img_area = image_bgr.shape[0] * image_bgr.shape[1]
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > img_area * 0.15:
+            return approx.reshape(4, 2).astype(np.float32)
+        rect = cv2.minAreaRect(c)
+        box = cv2.boxPoints(rect)
+        if cv2.contourArea(box) > img_area * 0.15:
+            return box.astype(np.float32)
+    return None
 
 
-# ------------------------------------------------------------
-# 3. Улучшение качества
-# ------------------------------------------------------------
-
-def sharpen_image(image: np.ndarray) -> np.ndarray:
-    """Нерезкое маскирование."""
-    blurred = cv2.GaussianBlur(image, (0, 0), 3.0)
-    sharp = cv2.addWeighted(image, 1.5, blurred, -0.5, 0)
-    return np.clip(sharp, 0, 255).astype(np.uint8)
-
-
-def denoise(image: np.ndarray) -> np.ndarray:
-    """Медианный фильтр для удаления шума."""
-    return cv2.medianBlur(image, 3)
-
-
-def color_enhance(image: np.ndarray) -> np.ndarray:
-    """Цветное улучшение (CLAHE + LAB + резкость)."""
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l_enh = clahe.apply(l)
-    lab_enh = cv2.merge([l_enh, a, b])
-    bgr = cv2.cvtColor(lab_enh, cv2.COLOR_LAB2BGR)
-    bgr = sharpen_image(bgr)
-    return denoise(bgr)
+def find_document_contour_brightness(image_bgr: np.ndarray) -> np.ndarray | None:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = np.ones((7, 7), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    img_area = image_bgr.shape[0] * image_bgr.shape[1]
+    min_area = img_area * 0.15
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.03 * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
+        rect = cv2.minAreaRect(c)
+        box = cv2.boxPoints(rect)
+        if cv2.contourArea(box.astype(np.float32)) >= min_area:
+            return box.astype(np.float32)
+    return None
 
 
-def clean_gray_enhance(image: np.ndarray) -> np.ndarray:
-    """Ч/Б с сохранением оттенков серого."""
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    enhanced = cv2.GaussianBlur(enhanced, (1, 1), 0)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
+    oh, ow = original.shape[:2]
+    wh, ww = warped.shape[:2]
+    if wh < 300 or ww < 300:
+        return False
+    original_area = oh * ow
+    warped_area = wh * ww
+    area_ratio = warped_area / original_area
+    if area_ratio < 0.15 or area_ratio > 0.95:
+        return False
+    aspect_orig = ow / oh
+    aspect_warp = ww / wh
+    if aspect_warp < 0.4 or aspect_warp > 2.5:
+        return False
+    if abs(aspect_warp - aspect_orig) > 1.5:
+        return False
+    return True
 
 
-def bw_enhance(image: np.ndarray) -> np.ndarray:
-    """Высококонтрастный бинарный скан."""
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_contrast = clahe.apply(gray)
-    binary = cv2.adaptiveThreshold(gray_contrast, 255,
-                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 15, 2)
-    kernel = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+# ----------------------------------------------------------------------
+# Надёжный fallback-обрезатель (всегда что-то возвращает)
+# ----------------------------------------------------------------------
 
-
-def enhance_image(image: np.ndarray, scan_mode: str) -> np.ndarray:
-    """Применяет выбранный режим улучшения."""
-    if scan_mode == "color":
-        return color_enhance(image)
-    if scan_mode == "clean_gray":
-        return clean_gray_enhance(image)
-    if scan_mode == "bw":
-        return bw_enhance(image)
-    return image
-
-
-# ------------------------------------------------------------
-# 4. Главная функция
-# ------------------------------------------------------------
-
-def process_document(
-    file_bytes: bytes,
-    scan_mode: str = "color",
-    auto_crop: bool = True
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+def simple_crop_by_content(image_bgr: np.ndarray) -> np.ndarray:
     """
-    Основной вход для API.
-    :param file_bytes: сырые байты изображения (JPEG/PNG)
-    :param scan_mode: "color", "clean_gray", "bw"
-    :param auto_crop: если True, пытается найти и выпрямить документ
-    :return: (обработанное изображение BGR, словарь метаданных)
+    Если классические детекторы не нашли контур, эта функция всё равно обрежет
+    по самому большому содержательному блоку (текст, изображение) с отступом.
     """
-    nparr = np.frombuffer(file_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Не удалось декодировать изображение. Поддерживаются JPEG/PNG.")
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
 
-    meta: Dict[str, Any] = {
-        "original_size": list(img.shape[:2]),
-        "auto_crop_performed": False,
-        "scan_mode": scan_mode,
-    }
+    # Попытка 1: светлая область (бумага)
+    mean_val = np.mean(blurred)
+    _, light_mask = cv2.threshold(blurred, mean_val - 15, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    light_closed = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours_light, _ = cv2.findContours(light_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours_light:
+        largest = max(contours_light, key=cv2.contourArea)
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+            x, y, w, h = cv2.boundingRect(largest)
+            return _apply_padding(image_bgr, x, y, w, h)
+
+    # Попытка 2: тёмный текст
+    _, dark_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours_dark, _ = cv2.findContours(dark_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours_dark:
+        largest = max(contours_dark, key=cv2.contourArea)
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+            x, y, w, h = cv2.boundingRect(largest)
+            return _apply_padding(image_bgr, x, y, w, h)
+
+    # Попытка 3: обрезаем всё, что не является полностью белым фоном
+    non_white = np.where(gray < 250)
+    if non_white[0].size > 0:
+        y_min, y_max = non_white[0].min(), non_white[0].max()
+        x_min, x_max = non_white[1].min(), non_white[1].max()
+        return _apply_padding(image_bgr, x_min, y_min, x_max - x_min, y_max - y_min)
+
+    # Если изображение абсолютно белое – возвращаем как есть
+    return image_bgr
+
+
+def _apply_padding(image, x, y, w, h, pad_ratio=0.02):
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+    x = max(0, x - pad_x)
+    y = max(0, y - pad_y)
+    w = min(w + 2 * pad_x, image.shape[1] - x)
+    h = min(h + 2 * pad_y, image.shape[0] - y)
+    return image[y:y+h, x:x+w].copy()
+
+
+# ----------------------------------------------------------------------
+# Основная функция обрезки
+# ----------------------------------------------------------------------
+
+def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str]:
+    """
+    Ищет документ и обрезает его (без поворота).
+    Если контур найден – делает обычную/перспективную обрезку.
+    Если нет – использует fallback по содержимому.
+    """
+    resized, scale = resize_for_detection(image_bgr)
+
+    points = find_document_contour_hough(resized)
+    detector = "hough"
+    if points is None:
+        points = find_document_contour_canny(resized)
+        detector = "canny"
+    if points is None:
+        points = find_document_contour_brightness(resized)
+        detector = "brightness" if points is not None else "none"
+
+    if points is not None:
+        points = points * scale
+        rect = order_points(points)
+        (tl, tr, br, bl) = rect
+        width_top = np.linalg.norm(tr - tl)
+        width_bottom = np.linalg.norm(br - bl)
+        height_left = np.linalg.norm(bl - tl)
+        height_right = np.linalg.norm(br - tr)
+        max_w = max(width_top, width_bottom)
+        min_w = min(width_top, width_bottom)
+        max_h = max(height_left, height_right)
+        min_h = min(height_left, height_right)
+
+        def angle_between(v1, v2):
+            dot = np.dot(v1, v2)
+            norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+            if norm == 0:
+                return 0
+            cos = dot / norm
+            cos = max(-1.0, min(1.0, cos))
+            return math.degrees(math.acos(cos))
+
+        angle_tl = angle_between(tr - tl, bl - tl)
+        angle_tr = angle_between(tl - tr, br - tr)
+        angle_br = angle_between(bl - br, tr - br)
+        angle_bl = angle_between(tl - bl, br - bl)
+        max_angle_dev = max(abs(a - 90) for a in [angle_tl, angle_tr, angle_br, angle_bl])
+        side_ratio_ok = (max_w / min_w < 1.02) and (max_h / min_h < 1.02)
+
+        if max_angle_dev < 2.0 and side_ratio_ok:
+            x, y, w, h = cv2.boundingRect(points.astype(np.int32))
+            cropped = _apply_padding(image_bgr, x, y, w, h)
+            return cropped, True, f"{detector}_straight"
+
+        warped = four_point_transform(image_bgr, points, border_value=(255, 255, 255))
+        if not is_reasonable_warp(image_bgr, warped):
+            x, y, w, h = cv2.boundingRect(points.astype(np.int32))
+            cropped = _apply_padding(image_bgr, x, y, w, h)
+            return cropped, True, f"{detector}_fallback"
+        return warped, True, f"{detector}_warp"
+
+    # Контур не найден → fallback по содержимому
+    fallback = simple_crop_by_content(image_bgr)
+    return fallback, True, "fallback_content"
+
+
+# ----------------------------------------------------------------------
+# Функции улучшения (сохранены мягкие)
+# ----------------------------------------------------------------------
+
+def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 0.8) -> np.ndarray:
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+
+
+def normalize_illumination(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape[:2]
+    kernel = max(31, (min(h, w) // 6) | 1)
+    background = cv2.GaussianBlur(gray, (kernel, kernel), 0)
+    return cv2.divide(gray, background, scale=255)
+
+
+def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    norm = normalize_illumination(gray)
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+
+    if enhance_level == "mild":
+        clip_limit, tile_size = 0.5, 8
+        d, sigma_c, sigma_s = 3, 8, 8
+        us_sigma, us_str = 0.25, 0.15
+    elif enhance_level == "normal":
+        clip_limit, tile_size = 1.0, 8
+        d, sigma_c, sigma_s = 5, 15, 15
+        us_sigma, us_str = 0.4, 0.35
+    else:  # strong
+        clip_limit, tile_size = 2.0, 8
+        d, sigma_c, sigma_s = 7, 25, 25
+        us_sigma, us_str = 0.6, 0.7
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+    l_chan = clahe.apply(norm)
+    l_chan = cv2.normalize(l_chan, None, 0, 255, cv2.NORM_MINMAX)
+    merged = cv2.merge([l_chan, a_chan, b_chan])
+    enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    enhanced = cv2.bilateralFilter(enhanced, d=d, sigmaColor=sigma_c, sigmaSpace=sigma_s)
+    enhanced = unsharp_mask(enhanced, sigma=us_sigma, strength=us_str)
+
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+    paper_mask = cv2.inRange(hsv, (0, 0, 140), (180, 60, 255)).astype(np.float32) / 255.0
+    paper_mask = cv2.GaussianBlur(paper_mask, (9, 9), 0)[..., None]
+    white_bg = np.full_like(enhanced, 247, dtype=np.float32)
+    mixed = enhanced.astype(np.float32) * (1.0 - 0.05 * paper_mask) + white_bg * (0.05 * paper_mask)
+    return np.clip(mixed, 0, 255).astype(np.uint8)
+
+
+def enhance_clean_gray(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
+    color_enhanced = enhance_color_scan(image_bgr, enhance_level)
+    gray = cv2.cvtColor(color_enhanced, cv2.COLOR_BGR2GRAY)
+    h = 2 if enhance_level == "mild" else 4
+    gray = cv2.fastNlMeansDenoising(gray, None, h=h, templateWindowSize=7, searchWindowSize=21)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    strength = 0.1 if enhance_level == "mild" else 0.3
+    return unsharp_mask(gray, sigma=0.5, strength=strength)
+
+
+def enhance_bw(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
+    clean_gray = enhance_clean_gray(image_bgr, enhance_level)
+    return cv2.adaptiveThreshold(clean_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, 31, 10)
+
+
+# ----------------------------------------------------------------------
+# API
+# ----------------------------------------------------------------------
+
+def process_document(image_bytes: bytes, scan_mode: str = "color", auto_crop: bool = False, enhance_level: str = "mild") -> tuple[np.ndarray, dict]:
+    if scan_mode == "mild_color":
+        scan_mode = "color"
+        enhance_level = "mild"
+
+    file_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(file_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Invalid image file")
+
+    original_h, original_w = image.shape[:2]
+    working = image
+    crop_applied = False
+    crop_detector = "disabled"
 
     if auto_crop:
-        quad = find_document_contour_robust(img)
-        if quad is None:
-            quad = find_document_lines_method(img)
-        if quad is None:
-            quad = find_document_fallback(img)
-            meta["fallback_used"] = True
-        else:
-            meta["auto_crop_performed"] = True
+        working, crop_applied, crop_detector = crop_document_if_found(image)
 
-        if quad is not None:
-            try:
-                img = four_point_transform(img, quad)
-                meta["warped_size"] = list(img.shape[:2])
-            except Exception as e:
-                meta["warp_error"] = str(e)
-                # оставляем img как есть
+    if scan_mode == "bw":
+        scan = enhance_bw(working, enhance_level)
+    elif scan_mode == "clean_gray":
+        scan = enhance_clean_gray(working, enhance_level)
+    else:
+        scan = enhance_color_scan(working, enhance_level)
 
-    enhanced = enhance_image(img, scan_mode)
-    return enhanced, meta
+    meta = {
+        "pipeline": "auto_crop_enhance" if auto_crop else "enhance_only",
+        "scan_mode": scan_mode,
+        "enhance_level": enhance_level,
+        "auto_crop_requested": auto_crop,
+        "auto_crop_applied": crop_applied,
+        "crop_detector": crop_detector,
+        "original_size": [original_w, original_h],
+        "result_size": [int(scan.shape[1]), int(scan.shape[0])],
+    }
+    return scan, meta
