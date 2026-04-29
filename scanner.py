@@ -29,7 +29,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+def four_point_transform(image: np.ndarray, pts: np.ndarray, border_value=(0,0,0)) -> np.ndarray:
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
@@ -49,7 +49,8 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, matrix, (max_width, max_height))
+    warped = cv2.warpPerspective(image, matrix, (max_width, max_height),
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
     return warped
 
 
@@ -216,14 +217,54 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
         return image_bgr, False, "none"
 
     points = points * scale_to_original
-    warped = four_point_transform(image_bgr, points)
 
+    # Проверка "ровности" документа
+    rect = order_points(points)
+    (tl, tr, br, bl) = rect
+
+    width_top = np.linalg.norm(tr - tl)
+    width_bottom = np.linalg.norm(br - bl)
+    height_left = np.linalg.norm(bl - tl)
+    height_right = np.linalg.norm(br - tr)
+
+    max_w = max(width_top, width_bottom)
+    min_w = min(width_top, width_bottom)
+    max_h = max(height_left, height_right)
+    min_h = min(height_left, height_right)
+
+    def angle_between(v1, v2):
+        dot = np.dot(v1, v2)
+        norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if norm == 0:
+            return 0
+        cos = dot / norm
+        cos = max(-1.0, min(1.0, cos))
+        return math.degrees(math.acos(cos))
+
+    angle_tl = angle_between(tr - tl, bl - tl)
+    angle_tr = angle_between(tl - tr, br - tr)
+    angle_br = angle_between(bl - br, tr - br)
+    angle_bl = angle_between(tl - bl, br - bl)
+    max_angle_dev = max(abs(a - 90) for a in [angle_tl, angle_tr, angle_br, angle_bl])
+
+    side_ratio_ok = (max_w / min_w < 1.05) and (max_h / min_h < 1.05)  # 5% допуск
+
+    # Если документ уже выровнен – обрезаем без перспективного преобразования
+    if max_angle_dev < 5 and side_ratio_ok:
+        x, y, w, h = cv2.boundingRect(points.astype(np.int32))
+        x = max(0, x)
+        y = max(0, y)
+        w = min(w, image_bgr.shape[1] - x)
+        h = min(h, image_bgr.shape[0] - y)
+        cropped = image_bgr[y:y+h, x:x+w].copy()
+        return cropped, True, f"{detector}_straight_crop"
+
+    # Иначе – перспективное выравнивание с белым фоном
+    warped = four_point_transform(image_bgr, points, border_value=(255, 255, 255))
     if not is_reasonable_warp(image_bgr, warped):
         return image_bgr, False, "rejected_warp"
-
     if warped is image_bgr:
         return image_bgr, False, "invalid_warp"
-
     return warped, True, detector
 
 
@@ -232,7 +273,6 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
 # ----------------------------------------------------------------------
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 0.8) -> np.ndarray:
-    """Нечёткое маскирование для повышения резкости."""
     blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma)
     return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
 
@@ -245,27 +285,19 @@ def normalize_illumination(gray: np.ndarray) -> np.ndarray:
 
 
 def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> np.ndarray:
-    """
-    Цветное улучшение с выбором уровня агрессивности.
-    enhance_level: 'mild', 'normal', 'strong'
-    - mild   : минимальная резкость и CLAHE, для документов с мелким текстом.
-    - normal : сбалансированные параметры (по умолчанию).
-    - strong : прежние агрессивные настройки (ярко, но риск искажений).
-    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     norm = normalize_illumination(gray)
 
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_chan, a_chan, b_chan = cv2.split(lab)
 
-    # Параметры CLAHE
     if enhance_level == "mild":
         clip_limit = 1.0
         tile_size = 8
     elif enhance_level == "strong":
         clip_limit = 2.8
         tile_size = 8
-    else:  # normal
+    else:
         clip_limit = 1.5
         tile_size = 8
 
@@ -276,7 +308,6 @@ def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> 
     merged = cv2.merge([l_chan, a_chan, b_chan])
     enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-    # Билатеральный фильтр
     if enhance_level == "mild":
         d = 5
         sigma_color = 15
@@ -292,7 +323,6 @@ def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> 
 
     enhanced = cv2.bilateralFilter(enhanced, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
 
-    # Unsharp mask
     if enhance_level == "mild":
         unsharp_sigma = 0.3
         unsharp_strength = 0.3
@@ -305,7 +335,6 @@ def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> 
 
     enhanced = unsharp_mask(enhanced, sigma=unsharp_sigma, strength=unsharp_strength)
 
-    # Отбеливание бумаги (одинаково мягкое для всех)
     hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
     paper_mask = cv2.inRange(hsv, (0, 0, 120), (180, 80, 255)).astype(np.float32) / 255.0
     paper_mask = cv2.GaussianBlur(paper_mask, (9, 9), 0)[..., None]
@@ -344,17 +373,8 @@ def process_document(
     image_bytes: bytes,
     scan_mode: str = "color",
     auto_crop: bool = False,
-    enhance_level: str = "normal",   # новый параметр: mild / normal / strong
+    enhance_level: str = "normal",
 ) -> tuple[np.ndarray, dict]:
-    """
-    Параметры:
-        image_bytes: байты изображения
-        scan_mode: 'color', 'clean_gray', 'bw', а также можно 'mild_color'
-                   (для удобства 'mild_color' автоматически установит enhance_level='mild')
-        auto_crop: обрезать ли документ
-        enhance_level: 'mild', 'normal', 'strong' – уровень агрессивности улучшений.
-    """
-    # Если в scan_mode явно указан mild_color – переключаем параметры
     if scan_mode == "mild_color":
         scan_mode = "color"
         enhance_level = "mild"
