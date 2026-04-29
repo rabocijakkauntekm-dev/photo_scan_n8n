@@ -59,145 +59,19 @@ def line_intersection(line1: np.ndarray, line2: np.ndarray) -> np.ndarray | None
 
 
 # ----------------------------------------------------------------------
-# Оценка угла наклона документа (по краевым линиям)
-# ----------------------------------------------------------------------
-
-def estimate_document_skew_angle(image_bgr: np.ndarray) -> float:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
-                            minLineLength=150, maxLineGap=50)
-    if lines is None or len(lines) < 3:
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            rect = cv2.minAreaRect(largest)
-            angle = rect[2]
-            if angle < -45:
-                angle += 90
-            elif angle > 45:
-                angle -= 90
-            return angle
-        return 0.0
-
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        if angle < -45:
-            angle += 180
-        elif angle > 45:
-            angle -= 180
-        angles.append(abs(angle))
-    return np.median(angles) if angles else 0.0
-
-
-# ----------------------------------------------------------------------
-# Поворот с автоматическим расширением холста
-# ----------------------------------------------------------------------
-
-def rotate_image_with_auto_canvas(image: np.ndarray, angle: float, border_value=(255, 255, 255)) -> np.ndarray:
-    h, w = image.shape[:2]
-    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-    center = (w / 2, h / 2)
-    rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
-    new_corners = cv2.transform(corners.reshape(1, -1, 2), rot_mat).reshape(-1, 2)
-    x_min, y_min = np.min(new_corners, axis=0)
-    x_max, y_max = np.max(new_corners, axis=0)
-    new_w = int(np.ceil(x_max - x_min))
-    new_h = int(np.ceil(y_max - y_min))
-    rot_mat[0, 2] += (new_w / 2) - center[0]
-    rot_mat[1, 2] += (new_h / 2) - center[1]
-    rotated = cv2.warpAffine(image, rot_mat, (new_w, new_h),
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=border_value)
-    return rotated
-
-
-# ----------------------------------------------------------------------
-# Надёжный fallback: обрезка по содержимому (текст + фон)
-# ----------------------------------------------------------------------
-
-def simple_crop_by_content(image_bgr: np.ndarray) -> np.ndarray | None:
-    """
-    Универсальная обрезка: находит либо светлую область документа на тёмном фоне,
-    либо тёмный текст на светлом фоне, и обрезает по boundingRect с отступом.
-    Если ничего не найдено, обрезает по boundingRect всех найденных контуров.
-    """
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-
-    # Попытка 1: светлая область (бумага)
-    mean_val = np.mean(blurred)
-    _, light_mask = cv2.threshold(blurred, mean_val - 15, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    light_closed = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    contours_light, _ = cv2.findContours(light_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours_light:
-        largest_light = max(contours_light, key=cv2.contourArea)
-        # минимальная относительная площадь 25% от кадра
-        if cv2.contourArea(largest_light) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
-            x, y, w, h = cv2.boundingRect(largest_light)
-            return _apply_padding(image_bgr, x, y, w, h)
-
-    # Попытка 2: тёмный текст на любом фоне
-    _, dark_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dark_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    contours_dark, _ = cv2.findContours(dark_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours_dark:
-        largest_dark = max(contours_dark, key=cv2.contourArea)
-        if cv2.contourArea(largest_dark) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
-            x, y, w, h = cv2.boundingRect(largest_dark)
-            return _apply_padding(image_bgr, x, y, w, h)
-
-    # Попытка 3: объединение всех контуров (светлых и тёмных)
-    all_contours = list(contours_light) if contours_light else []
-    all_contours.extend(contours_dark if contours_dark else [])
-    if all_contours:
-        combined = np.vstack([c for c in all_contours if cv2.contourArea(c) > 50])
-        if combined.size > 0:
-            x, y, w, h = cv2.boundingRect(combined)
-            # если ширина/высота слишком малы, игнорируем
-            if w > 50 and h > 50:
-                return _apply_padding(image_bgr, x, y, w, h)
-
-    # Если ничего не нашли, возвращаем слегка обрезанную версию (убирая белые поля)
-    # Находим границы, где яркость не равна 255
-    non_white = np.where(gray < 250)
-    if non_white[0].size > 0:
-        y_min, y_max = non_white[0].min(), non_white[0].max()
-        x_min, x_max = non_white[1].min(), non_white[1].max()
-        return _apply_padding(image_bgr, x_min, y_min, x_max - x_min, y_max - y_min)
-
-    return None
-
-
-def _apply_padding(image, x, y, w, h, pad_ratio=0.02):
-    pad_x = int(w * pad_ratio)
-    pad_y = int(h * pad_ratio)
-    x = max(0, x - pad_x)
-    y = max(0, y - pad_y)
-    w = min(w + 2 * pad_x, image.shape[1] - x)
-    h = min(h + 2 * pad_y, image.shape[0] - y)
-    return image[y:y+h, x:x+w].copy()
-
-
-# ----------------------------------------------------------------------
-# Детекция контура документа (с ослабленными порогами)
+# Детекция контура документа
 # ----------------------------------------------------------------------
 
 def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 40, 120)   # снижены пороги для слабых краёв
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=120, maxLineGap=60)
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=150, maxLineGap=50)
     if lines is None or len(lines) < 4:
         return None
-    horizontal, vertical = [], []
+    horizontal = []
+    vertical = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
         angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
@@ -205,16 +79,18 @@ def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
             angle += 180
         elif angle > 90:
             angle -= 180
-        if abs(angle) <= 12:
+        if abs(angle) <= 10:
             horizontal.append((x1, y1, x2, y2))
-        elif abs(angle - 90) <= 12:
+        elif abs(angle - 90) <= 10:
             vertical.append((x1, y1, x2, y2))
     if len(horizontal) < 2 or len(vertical) < 2:
         return None
     horizontal.sort(key=lambda l: (l[1] + l[3]) / 2)
     vertical.sort(key=lambda l: (l[0] + l[2]) / 2)
-    top_line, bottom_line = horizontal[0], horizontal[-1]
-    left_line, right_line = vertical[0], vertical[-1]
+    top_line = horizontal[0]
+    bottom_line = horizontal[-1]
+    left_line = vertical[0]
+    right_line = vertical[-1]
     tl = line_intersection(top_line, left_line)
     tr = line_intersection(top_line, right_line)
     br = line_intersection(bottom_line, right_line)
@@ -233,7 +109,7 @@ def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
 def find_document_contour_canny(image_bgr: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 60, 180)  # немного смягчено
+    edges = cv2.Canny(gray, 75, 200)
     edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
@@ -296,21 +172,72 @@ def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
 
 
 # ----------------------------------------------------------------------
+# Надёжный fallback-обрезатель (всегда что-то возвращает)
+# ----------------------------------------------------------------------
+
+def simple_crop_by_content(image_bgr: np.ndarray) -> np.ndarray:
+    """
+    Если классические детекторы не нашли контур, эта функция всё равно обрежет
+    по самому большому содержательному блоку (текст, изображение) с отступом.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+
+    # Попытка 1: светлая область (бумага)
+    mean_val = np.mean(blurred)
+    _, light_mask = cv2.threshold(blurred, mean_val - 15, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    light_closed = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours_light, _ = cv2.findContours(light_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours_light:
+        largest = max(contours_light, key=cv2.contourArea)
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+            x, y, w, h = cv2.boundingRect(largest)
+            return _apply_padding(image_bgr, x, y, w, h)
+
+    # Попытка 2: тёмный текст
+    _, dark_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark_closed = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours_dark, _ = cv2.findContours(dark_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours_dark:
+        largest = max(contours_dark, key=cv2.contourArea)
+        if cv2.contourArea(largest) > image_bgr.shape[0] * image_bgr.shape[1] * 0.25:
+            x, y, w, h = cv2.boundingRect(largest)
+            return _apply_padding(image_bgr, x, y, w, h)
+
+    # Попытка 3: обрезаем всё, что не является полностью белым фоном
+    non_white = np.where(gray < 250)
+    if non_white[0].size > 0:
+        y_min, y_max = non_white[0].min(), non_white[0].max()
+        x_min, x_max = non_white[1].min(), non_white[1].max()
+        return _apply_padding(image_bgr, x_min, y_min, x_max - x_min, y_max - y_min)
+
+    # Если изображение абсолютно белое – возвращаем как есть
+    return image_bgr
+
+
+def _apply_padding(image, x, y, w, h, pad_ratio=0.02):
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+    x = max(0, x - pad_x)
+    y = max(0, y - pad_y)
+    w = min(w + 2 * pad_x, image.shape[1] - x)
+    h = min(h + 2 * pad_y, image.shape[0] - y)
+    return image[y:y+h, x:x+w].copy()
+
+
+# ----------------------------------------------------------------------
 # Основная функция обрезки
 # ----------------------------------------------------------------------
 
 def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str]:
-    # Поворот
-    angle = estimate_document_skew_angle(image_bgr)
-    if abs(angle) > 0.5:
-        rotated = rotate_image_with_auto_canvas(image_bgr, angle, border_value=(255, 255, 255))
-        used_rotation = True
-    else:
-        rotated = image_bgr
-        used_rotation = False
+    """
+    Ищет документ и обрезает его (без поворота).
+    Если контур найден – делает обычную/перспективную обрезку.
+    Если нет – использует fallback по содержимому.
+    """
+    resized, scale = resize_for_detection(image_bgr)
 
-    # Поиск контура на повёрнутом изображении
-    resized, scale = resize_for_detection(rotated)
     points = find_document_contour_hough(resized)
     detector = "hough"
     if points is None:
@@ -351,27 +278,23 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
 
         if max_angle_dev < 2.0 and side_ratio_ok:
             x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-            cropped = _apply_padding(rotated, x, y, w, h)
-            return cropped, True, f"{detector}_straight_{angle:.1f}"
+            cropped = _apply_padding(image_bgr, x, y, w, h)
+            return cropped, True, f"{detector}_straight"
 
-        warped = four_point_transform(rotated, points, border_value=(255, 255, 255))
-        if not is_reasonable_warp(rotated, warped):
+        warped = four_point_transform(image_bgr, points, border_value=(255, 255, 255))
+        if not is_reasonable_warp(image_bgr, warped):
             x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-            cropped = _apply_padding(rotated, x, y, w, h)
-            return cropped, True, f"fallback_crop_{angle:.1f}"
-        return warped, True, f"{detector}_warp_{angle:.1f}"
+            cropped = _apply_padding(image_bgr, x, y, w, h)
+            return cropped, True, f"{detector}_fallback"
+        return warped, True, f"{detector}_warp"
 
-    # Контур не найден → принудительная обрезка по содержимому
-    fallback = simple_crop_by_content(rotated)
-    if fallback is not None:
-        return fallback, True, f"fallback_content_{angle:.1f}"
-
-    # Если ничего не вышло — возвращаем повёрнутое без обрезки
-    return rotated, True, f"nocrop_{angle:.1f}"
+    # Контур не найден → fallback по содержимому
+    fallback = simple_crop_by_content(image_bgr)
+    return fallback, True, "fallback_content"
 
 
 # ----------------------------------------------------------------------
-# Функции улучшения (с ослабленным unsharp mask)
+# Функции улучшения (сохранены мягкие)
 # ----------------------------------------------------------------------
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 0.8) -> np.ndarray:
@@ -438,7 +361,7 @@ def enhance_bw(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray
 
 
 # ----------------------------------------------------------------------
-# Точка входа API
+# API
 # ----------------------------------------------------------------------
 
 def process_document(image_bytes: bytes, scan_mode: str = "color", auto_crop: bool = False, enhance_level: str = "mild") -> tuple[np.ndarray, dict]:
