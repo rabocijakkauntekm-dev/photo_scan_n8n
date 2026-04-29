@@ -29,7 +29,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def four_point_transform(image: np.ndarray, pts: np.ndarray, border_value=(0,0,0)) -> np.ndarray:
+def four_point_transform(image: np.ndarray, pts: np.ndarray, border_value=(255, 255, 255)) -> np.ndarray:
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
 
@@ -54,29 +54,6 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray, border_value=(0,0,0
     return warped
 
 
-def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
-    oh, ow = original.shape[:2]
-    wh, ww = warped.shape[:2]
-
-    if wh < 300 or ww < 300:
-        return False
-
-    original_area = oh * ow
-    warped_area = wh * ww
-    area_ratio = warped_area / original_area
-    if area_ratio < 0.1 or area_ratio > 0.95:
-        return False
-
-    aspect_orig = ow / oh
-    aspect_warp = ww / wh
-    if aspect_warp < 0.3 or aspect_warp > 3.5:
-        return False
-    if abs(aspect_warp - aspect_orig) > 2.0:
-        return False
-
-    return True
-
-
 def line_intersection(line1: np.ndarray, line2: np.ndarray) -> np.ndarray | None:
     x1, y1, x2, y2 = line1
     x3, y3, x4, y4 = line2
@@ -97,8 +74,8 @@ def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 50, 150)
 
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                            minLineLength=120, maxLineGap=60)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=150, maxLineGap=50)
     if lines is None or len(lines) < 4:
         return None
 
@@ -111,9 +88,9 @@ def find_document_contour_hough(image_bgr: np.ndarray) -> np.ndarray | None:
             angle += 180
         elif angle > 90:
             angle -= 180
-        if abs(angle) <= 15:
+        if abs(angle) <= 10:
             horizontal.append((x1, y1, x2, y2))
-        elif abs(angle - 90) <= 15:
+        elif abs(angle - 90) <= 10:
             vertical.append((x1, y1, x2, y2))
 
     if len(horizontal) < 2 or len(vertical) < 2:
@@ -202,8 +179,14 @@ def find_document_contour_brightness(image_bgr: np.ndarray) -> np.ndarray | None
 
 
 def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str]:
+    """
+    Пытается найти документ и выпрямить его.
+    Если документ уже почти ровный, делает простую обрезку (без warp'а).
+    Добавляет небольшой отступ, чтобы не обрезать края.
+    """
     resized, scale_to_original = resize_for_detection(image_bgr)
 
+    # Пробуем три детектора по очереди
     points = find_document_contour_hough(resized)
     detector = "hough"
     if points is None:
@@ -218,7 +201,7 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
 
     points = points * scale_to_original
 
-    # Проверка "ровности" документа
+    # Оцениваем "ровность" найденного четырёхугольника
     rect = order_points(points)
     (tl, tr, br, bl) = rect
 
@@ -247,25 +230,65 @@ def crop_document_if_found(image_bgr: np.ndarray) -> tuple[np.ndarray, bool, str
     angle_bl = angle_between(tl - bl, br - bl)
     max_angle_dev = max(abs(a - 90) for a in [angle_tl, angle_tr, angle_br, angle_bl])
 
-    side_ratio_ok = (max_w / min_w < 1.05) and (max_h / min_h < 1.05)  # 5% допуск
+    side_ratio_ok = (max_w / min_w < 1.02) and (max_h / min_h < 1.02)  # допуск 2%
 
     # Если документ уже выровнен – обрезаем без перспективного преобразования
-    if max_angle_dev < 5 and side_ratio_ok:
+    if max_angle_dev < 2.0 and side_ratio_ok:
         x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-        x = max(0, x)
-        y = max(0, y)
-        w = min(w, image_bgr.shape[1] - x)
-        h = min(h, image_bgr.shape[0] - y)
+        # Добавляем отступ в 2% от размера, но не выходим за границы изображения
+        pad_w = int(w * 0.02)
+        pad_h = int(h * 0.02)
+        x = max(0, x - pad_w)
+        y = max(0, y - pad_h)
+        w = min(w + 2 * pad_w, image_bgr.shape[1] - x)
+        h = min(h + 2 * pad_h, image_bgr.shape[0] - y)
         cropped = image_bgr[y:y+h, x:x+w].copy()
         return cropped, True, f"{detector}_straight_crop"
 
     # Иначе – перспективное выравнивание с белым фоном
     warped = four_point_transform(image_bgr, points, border_value=(255, 255, 255))
+
+    # Проверяем разумность результата
     if not is_reasonable_warp(image_bgr, warped):
-        return image_bgr, False, "rejected_warp"
+        # fallback: простая обрезка с отступом
+        x, y, w, h = cv2.boundingRect(points.astype(np.int32))
+        pad_w = int(w * 0.02)
+        pad_h = int(h * 0.02)
+        x = max(0, x - pad_w)
+        y = max(0, y - pad_h)
+        w = min(w + 2 * pad_w, image_bgr.shape[1] - x)
+        h = min(h + 2 * pad_h, image_bgr.shape[0] - y)
+        return image_bgr[y:y+h, x:x+w].copy(), True, "fallback_crop"
+
     if warped is image_bgr:
         return image_bgr, False, "invalid_warp"
+
     return warped, True, detector
+
+
+def is_reasonable_warp(original: np.ndarray, warped: np.ndarray) -> bool:
+    oh, ow = original.shape[:2]
+    wh, ww = warped.shape[:2]
+
+    if wh < 300 or ww < 300:
+        return False
+
+    original_area = oh * ow
+    warped_area = wh * ww
+    area_ratio = warped_area / original_area
+    if area_ratio < 0.15 or area_ratio > 0.95:   # было 0.1, ужесточили
+        return False
+
+    aspect_orig = ow / oh
+    aspect_warp = ww / wh
+    if aspect_warp < 0.4 or aspect_warp > 2.5:   # более жёсткие границы
+        return False
+    if abs(aspect_warp - aspect_orig) > 1.5:    # меньше допустимое отклонение
+        return False
+
+    # Проверяем, что результат не слишком вытянутый по сравнению с исходным boundingRect (если есть)
+    # Эта проверка уже частично покрыта aspect ratio, но оставим для надёжности.
+    return True
 
 
 # ----------------------------------------------------------------------
@@ -284,22 +307,41 @@ def normalize_illumination(gray: np.ndarray) -> np.ndarray:
     return cv2.divide(gray, background, scale=255)
 
 
-def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> np.ndarray:
+def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
+    """
+    Цветное улучшение. По умолчанию используется 'mild' для максимальной сохранности текста.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     norm = normalize_illumination(gray)
 
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_chan, a_chan, b_chan = cv2.split(lab)
 
+    # Параметры в зависимости от уровня
     if enhance_level == "mild":
-        clip_limit = 1.0
+        clip_limit = 0.8
         tile_size = 8
-    elif enhance_level == "strong":
-        clip_limit = 2.8
+        d = 5
+        sigma_color = 10
+        sigma_space = 10
+        unsharp_sigma = 0.3
+        unsharp_strength = 0.2
+    elif enhance_level == "normal":
+        clip_limit = 1.2
         tile_size = 8
-    else:
-        clip_limit = 1.5
+        d = 5
+        sigma_color = 20
+        sigma_space = 20
+        unsharp_sigma = 0.4
+        unsharp_strength = 0.4
+    else:  # strong
+        clip_limit = 2.0
         tile_size = 8
+        d = 7
+        sigma_color = 30
+        sigma_space = 30
+        unsharp_sigma = 0.6
+        unsharp_strength = 0.7
 
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
     l_chan = clahe.apply(norm)
@@ -308,52 +350,29 @@ def enhance_color_scan(image_bgr: np.ndarray, enhance_level: str = "normal") -> 
     merged = cv2.merge([l_chan, a_chan, b_chan])
     enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-    if enhance_level == "mild":
-        d = 5
-        sigma_color = 15
-        sigma_space = 15
-    elif enhance_level == "strong":
-        d = 7
-        sigma_color = 35
-        sigma_space = 35
-    else:
-        d = 5
-        sigma_color = 25
-        sigma_space = 25
-
     enhanced = cv2.bilateralFilter(enhanced, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
-
-    if enhance_level == "mild":
-        unsharp_sigma = 0.3
-        unsharp_strength = 0.3
-    elif enhance_level == "strong":
-        unsharp_sigma = 0.8
-        unsharp_strength = 0.95
-    else:
-        unsharp_sigma = 0.5
-        unsharp_strength = 0.6
-
     enhanced = unsharp_mask(enhanced, sigma=unsharp_sigma, strength=unsharp_strength)
 
+    # Лёгкое отбеливание бумаги
     hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
-    paper_mask = cv2.inRange(hsv, (0, 0, 120), (180, 80, 255)).astype(np.float32) / 255.0
+    paper_mask = cv2.inRange(hsv, (0, 0, 130), (180, 70, 255)).astype(np.float32) / 255.0
     paper_mask = cv2.GaussianBlur(paper_mask, (9, 9), 0)[..., None]
     white_bg = np.full_like(enhanced, 247, dtype=np.float32)
-    mixed = enhanced.astype(np.float32) * (1.0 - 0.15 * paper_mask) + white_bg * (0.15 * paper_mask)
+    mixed = enhanced.astype(np.float32) * (1.0 - 0.1 * paper_mask) + white_bg * (0.1 * paper_mask)
     return np.clip(mixed, 0, 255).astype(np.uint8)
 
 
-def enhance_clean_gray(image_bgr: np.ndarray, enhance_level: str = "normal") -> np.ndarray:
+def enhance_clean_gray(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
     color_enhanced = enhance_color_scan(image_bgr, enhance_level=enhance_level)
     gray = cv2.cvtColor(color_enhanced, cv2.COLOR_BGR2GRAY)
-    h = 4 if enhance_level == "mild" else 6
+    h = 3 if enhance_level == "mild" else 5
     gray = cv2.fastNlMeansDenoising(gray, None, h=h, templateWindowSize=7, searchWindowSize=21)
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    strength = 0.3 if enhance_level == "mild" else 0.45
-    return unsharp_mask(gray, sigma=0.7, strength=strength)
+    strength = 0.2 if enhance_level == "mild" else 0.4
+    return unsharp_mask(gray, sigma=0.5, strength=strength)
 
 
-def enhance_bw(image_bgr: np.ndarray, enhance_level: str = "normal") -> np.ndarray:
+def enhance_bw(image_bgr: np.ndarray, enhance_level: str = "mild") -> np.ndarray:
     clean_gray = enhance_clean_gray(image_bgr, enhance_level=enhance_level)
     return cv2.adaptiveThreshold(
         clean_gray,
@@ -373,8 +392,19 @@ def process_document(
     image_bytes: bytes,
     scan_mode: str = "color",
     auto_crop: bool = False,
-    enhance_level: str = "normal",
+    enhance_level: str = "mild",   # теперь по умолчанию мягкий режим
 ) -> tuple[np.ndarray, dict]:
+    """
+    Основной конвейер обработки документа.
+
+    Параметры:
+        image_bytes: байты изображения (PNG, JPEG и т.д.)
+        scan_mode: 'color', 'clean_gray', 'bw', 'mild_color' (автоматически включит mild)
+        auto_crop: выполнять ли автоматическое кадрирование и выпрямление
+        enhance_level: 'mild', 'normal', 'strong' – уровень агрессивности улучшений.
+                       По умолчанию 'mild' для сохранения читаемости текста.
+    """
+    # Обработка псевдонима scan_mode
     if scan_mode == "mild_color":
         scan_mode = "color"
         enhance_level = "mild"
